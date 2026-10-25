@@ -6,7 +6,9 @@ Accessible at:
 """
 from __future__ import annotations
 
+import json
 import time
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from collections import defaultdict
@@ -22,6 +24,178 @@ router = APIRouter(tags=["analytics"])
 def get_service() -> ConversationService:
     from src.app import service
     return service
+
+
+def fetch_parsing_metrics() -> Dict[str, Any]:
+    """
+    Fetches real-time indexing & parsing telemetry from the Jarvis Parser daemon (http://localhost:8001).
+    Computes node counts, relationship counts, parse error statistics, stage latency averages,
+    and LLM / embedding cost breakdowns.
+    """
+    jobs: List[Dict[str, Any]] = []
+    repos: List[Dict[str, Any]] = []
+    is_connected = False
+
+    # 1. Fetch indexing jobs
+    try:
+        req = urllib.request.Request(
+            "http://localhost:8001/api/index",
+            headers={"User-Agent": "Jarvis-Analytics/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            jobs = json.loads(resp.read().decode("utf-8"))
+        is_connected = True
+    except Exception as e:
+        jobs = []
+
+    # 2. Fetch indexed repos
+    try:
+        req2 = urllib.request.Request(
+            "http://localhost:8001/api/repos",
+            headers={"User-Agent": "Jarvis-Analytics/1.0"}
+        )
+        with urllib.request.urlopen(req2, timeout=2.5) as resp2:
+            repos = json.loads(resp2.read().decode("utf-8"))
+    except Exception as e:
+        repos = []
+
+    total_jobs = len(jobs)
+    completed_jobs = sum(1 for j in jobs if j.get("status") == "done")
+    failed_jobs = sum(1 for j in jobs if j.get("status") == "failed")
+    running_jobs = sum(1 for j in jobs if j.get("status") in ("running", "queued"))
+
+    total_nodes = sum(j.get("node_count") or 0 for j in jobs)
+    total_edges = sum(j.get("relationship_count") or 0 for j in jobs)
+    total_errors = sum(j.get("parse_errors") or 0 for j in jobs)
+
+    # Cost model:
+    # LLM descriptions: ~200 input tokens, ~40 output tokens per node
+    # gpt-4o-mini rates: $0.150/1M in ($0.00003), $0.600/1M out ($0.000024) = $0.000054 / node
+    # Milvus embeddings (text-embedding-3-small): ~200 tokens/node @ $0.02/1M = $0.000004 / node
+    # Total actual per node = $0.000058
+    # For comparison, gpt-4o rates ($2.50 in, $10.00 out) = $0.000904 / node
+    total_llm_input_tokens = total_nodes * 200
+    total_llm_output_tokens = total_nodes * 40
+    total_llm_tokens = total_llm_input_tokens + total_llm_output_tokens
+    total_embedding_tokens = total_nodes * 200
+    total_parsing_tokens = total_llm_tokens + total_embedding_tokens
+
+    llm_spend = total_nodes * 0.000054
+    embedding_spend = total_nodes * 0.000004
+    total_parsing_cost = round(llm_spend + embedding_spend, 5)
+    total_gpt4o_spend = round(total_nodes * 0.000904, 5)
+
+    # Stage averages & total durations
+    stage_totals: Dict[str, float] = {}
+    stage_counts: Dict[str, int] = {}
+    job_durations: List[float] = []
+
+    formatted_jobs: List[Dict[str, Any]] = []
+    for j in sorted(jobs, key=lambda x: x.get("created_at") or 0, reverse=True):
+        st = j.get("created_at") or 0
+        fin = j.get("finished_at") or 0
+        dur = round(fin - st, 1) if (fin and st and fin >= st) else 0.0
+        if dur > 0:
+            job_durations.append(dur)
+
+        nc = j.get("node_count") or 0
+        rel_c = j.get("relationship_count") or 0
+        job_cost = round(nc * 0.000058, 5)
+
+        stages_info: List[Dict[str, Any]] = []
+        for s in j.get("stages", []):
+            s_name = s.get("name")
+            s_st = s.get("started_at")
+            s_fin = s.get("finished_at")
+            s_dur = round(s_fin - s_st, 2) if (s_fin and s_st and s_fin >= s_st) else 0.0
+            if s_name and s_dur > 0:
+                stage_totals[s_name] = stage_totals.get(s_name, 0.0) + s_dur
+                stage_counts[s_name] = stage_counts.get(s_name, 0) + 1
+            stages_info.append({
+                "number": s.get("number"),
+                "name": s_name,
+                "status": s.get("status"),
+                "duration_s": s_dur,
+                "detail": s.get("detail", "")
+            })
+
+        formatted_jobs.append({
+            "job_id": j.get("job_id"),
+            "repository_id": j.get("repository_id") or j.get("repo_url"),
+            "repo_url": j.get("repo_url"),
+            "branch": j.get("branch", "main"),
+            "cluster_id": j.get("cluster_id", "default"),
+            "status": j.get("status"),
+            "node_count": nc,
+            "relationship_count": rel_c,
+            "parse_errors": j.get("parse_errors") or 0,
+            "error_details": j.get("error_details") or [],
+            "duration_s": dur,
+            "estimated_cost": job_cost,
+            "stages": stages_info,
+            "created_at": st,
+            "finished_at": fin,
+        })
+
+    total_pipeline_time = sum(stage_totals.values())
+    stage_breakdown: List[Dict[str, Any]] = []
+    # Standard stage order
+    stage_order = [
+        "Git Clone", "AST Parsing", "Graph Building",
+        "Neo4j Write", "Cross-Repo Linking", "LLM Descriptions", "Milvus Embeddings"
+    ]
+    all_stage_names = list(stage_totals.keys())
+    # Sort by standard order if known
+    sorted_stages = sorted(
+        all_stage_names,
+        key=lambda x: stage_order.index(x) if x in stage_order else 99
+    )
+
+    for s_name in sorted_stages:
+        tot_time = stage_totals[s_name]
+        cnt = stage_counts.get(s_name, 1)
+        avg_t = round(tot_time / cnt, 2)
+        pct = round((tot_time / total_pipeline_time * 100), 1) if total_pipeline_time > 0 else 0.0
+        stage_breakdown.append({
+            "name": s_name,
+            "avg_duration_s": avg_t,
+            "total_duration_s": round(tot_time, 1),
+            "run_count": cnt,
+            "percentage": pct
+        })
+
+    avg_pipeline_duration = round(sum(job_durations) / len(job_durations), 1) if job_durations else 0.0
+
+    return {
+        "is_connected": is_connected,
+        "endpoint": "http://localhost:8001",
+        "total_jobs": total_jobs,
+        "completed_jobs": completed_jobs,
+        "failed_jobs": failed_jobs,
+        "running_jobs": running_jobs,
+        "total_nodes_indexed": total_nodes,
+        "total_relationships": total_edges,
+        "total_parse_errors": total_errors,
+        "tokens": {
+            "llm_input_tokens": total_llm_input_tokens,
+            "llm_output_tokens": total_llm_output_tokens,
+            "llm_total_tokens": total_llm_tokens,
+            "embedding_tokens": total_embedding_tokens,
+            "total_tokens": total_parsing_tokens,
+        },
+        "costs": {
+            "llm_model": "gpt-4o-mini",
+            "embedding_model": "text-embedding-3-small",
+            "llm_spend": round(llm_spend, 5),
+            "embedding_spend": round(embedding_spend, 5),
+            "total_cost": total_parsing_cost,
+            "gpt4o_comparison_spend": total_gpt4o_spend,
+        },
+        "avg_pipeline_duration_s": avg_pipeline_duration,
+        "stages": stage_breakdown,
+        "repos": repos,
+        "jobs": formatted_jobs,
+    }
 
 
 @router.get("/api/analytics/summary", summary="Get comprehensive admin analytics summary")
@@ -232,6 +406,15 @@ async def get_analytics_summary(
             "updated_at": c.get("updated_at"),
         })
 
+    # Fetch Parsing & Indexing Telemetry
+    parsing_metrics = fetch_parsing_metrics()
+    parsing_spend = parsing_metrics.get("costs", {}).get("total_cost", 0.0)
+    parsing_tokens = parsing_metrics.get("tokens", {}).get("total_tokens", 0)
+
+    # Combined platform aggregates
+    combined_platform_spend = round(total_cost + parsing_spend, 5)
+    combined_platform_tokens = total_tokens + parsing_tokens
+
     return {
         "overview": {
             "total_conversations": total_convs,
@@ -253,6 +436,11 @@ async def get_analytics_summary(
             "avg_turns_per_conv": avg_turns_per_conv,
             "total_tool_calls": total_tool_calls,
             "total_citations": total_citations,
+            # Platform overall
+            "combined_platform_spend": combined_platform_spend,
+            "combined_platform_tokens": combined_platform_tokens,
+            "parsing_spend": parsing_spend,
+            "chat_spend": round(total_cost, 6),
         },
         "database": {
             "database_name": all_data.get("database", "jarvis-conversations"),
@@ -261,6 +449,7 @@ async def get_analytics_summary(
             "conversations_count": total_convs,
             "messages_count": total_msgs,
         },
+        "parsing": parsing_metrics,
         "models": models_summary,
         "timeline": timeline_list,
         "repositories": repos_summary,
@@ -281,7 +470,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>JARVIS Admin Analytics Portal — Cosmos DB</title>
+  <title>JARVIS Admin Analytics Portal — Cosmos DB & Indexing Telemetry</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -297,6 +486,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       --purple: #a855f7;
       --red: #ef4444;
       --cyan: #38bdf8;
+      --amber: #f59e0b;
       --text: #f0f3f8;
       --muted: #8b949e;
       --faint: #586069;
@@ -336,10 +526,14 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       border-radius: 6px;
       letter-spacing: 0.04em;
       text-transform: uppercase;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
     }
     .pill-blue { background: rgba(0, 120, 212, 0.15); color: var(--cyan); border: 1px solid rgba(0, 120, 212, 0.3); }
     .pill-green { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
     .pill-orange { background: rgba(249, 115, 22, 0.15); color: var(--orange); border: 1px solid rgba(249, 115, 22, 0.3); }
+    .pill-purple { background: rgba(168, 85, 247, 0.15); color: var(--purple); border: 1px solid rgba(168, 85, 247, 0.3); }
     .pill-red { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }
     
     .status-bar {
@@ -415,6 +609,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       gap: 8px;
       border-bottom: 1px solid var(--card-border);
       margin-bottom: 20px;
+      overflow-x: auto;
     }
     .tab-btn {
       background: none;
@@ -429,6 +624,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       align-items: center;
       gap: 8px;
       transition: all 0.15s;
+      white-space: nowrap;
     }
     .tab-btn.active {
       color: #fff;
@@ -449,6 +645,9 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--muted);
       font-weight: 600;
       border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
     td {
       padding: 12px 14px;
@@ -457,6 +656,22 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     }
     tr:hover td { background: rgba(255, 255, 255, 0.02); }
     code, .mono { font-family: 'Fira Code', monospace; }
+
+    /* Progress & bar charts */
+    .bar-wrapper {
+      background: rgba(255, 255, 255, 0.04);
+      height: 24px;
+      border-radius: 4px;
+      overflow: hidden;
+      padding: 0 4px;
+      display: flex;
+      align-items: center;
+    }
+    .bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
   </style>
 </head>
 <body>
@@ -465,17 +680,18 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     <div>
       <div class="header-title">
         <span style="font-size: 24px;">📊</span>
-        <h1>JARVIS Admin Analytics Portal</h1>
+        <h1>JARVIS Platform Telemetry & Analytics</h1>
         <span class="pill pill-blue">Cosmos DB Live</span>
+        <span class="pill pill-green" id="parserStatusPill">⚡ Parser Online</span>
       </div>
       <p style="font-size: 13px; color: var(--muted);">
-        Dedicated, standalone telemetry dashboard measuring tokens, costs, models, and conversation sessions.
+        Enterprise analytics dashboard monitoring conversational sessions, code graph indexing, pipeline latencies, token consumption, and cost distributions.
       </p>
     </div>
 
-    <div style="display: flex; gap: 10px; align-items: center;">
+    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
       <a href="/explorer" target="_blank" class="btn">
-        <span>🪐 Cosmos Data Explorer</span> ↗
+        <span>🪐 Cosmos Explorer</span> ↗
       </a>
       <button id="btnAutoRefresh" class="btn" onclick="toggleAutoRefresh()">○ Auto-Refresh (15s)</button>
       <button class="btn btn-primary" onclick="loadAnalytics()">↻ Refresh Now</button>
@@ -488,60 +704,63 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       <strong id="dbName">Cosmos DB: jarvis-conversations</strong>
       <span style="color: var(--muted); margin: 0 8px;">·</span>
       <span id="containersInfo">Loading containers...</span>
+      <span style="color: var(--muted); margin: 0 8px;">·</span>
+      <span id="parserEndpoint">Parser: http://localhost:8001</span>
     </div>
     <div class="mono" style="font-size: 11px; color: var(--faint);" id="dbEndpoint">Endpoint: Local / Azure Cosmos DB</div>
   </div>
 
-  <!-- KPI Grid -->
+  <!-- Primary Top KPI Grid -->
   <div class="grid-kpis" id="kpiGrid">
-    <div class="card" style="border-color: rgba(249, 115, 22, 0.3);">
-      <div class="card-top" style="color: var(--orange);"><span>Cumulative Spend</span><span>💰</span></div>
-      <div class="card-value" id="kpiCost">$0.0000</div>
-      <div class="card-sub" id="kpiAvgCost">Loading...</div>
+    <div class="card" style="border-color: rgba(249, 115, 22, 0.4); background: linear-gradient(180deg, rgba(249,115,22,0.06), var(--card-bg));">
+      <div class="card-top" style="color: var(--orange);"><span>Total Platform Investment</span><span>💰</span></div>
+      <div class="card-value" id="kpiTotalPlatformSpend">$0.0000</div>
+      <div class="card-sub" id="kpiPlatformSpendBreakdown">Chat: $0.00 · Parsing: $0.00</div>
+    </div>
+    <div class="card" style="border-color: rgba(168, 85, 247, 0.3);">
+      <div class="card-top" style="color: var(--purple);"><span>Parsing & Indexing Spend</span><span>⚡</span></div>
+      <div class="card-value" id="kpiParsingSpend">$0.0000</div>
+      <div class="card-sub" id="kpiParsingTokens">0 tokens · gpt-4o-mini</div>
     </div>
     <div class="card" style="border-color: rgba(0, 120, 212, 0.3);">
-      <div class="card-top" style="color: var(--cyan);"><span>Tokens Consumed</span><span>⚡</span></div>
-      <div class="card-value" id="kpiTokens">0</div>
-      <div class="card-sub" id="kpiTokensBreakdown">0 in · 0 out</div>
+      <div class="card-top" style="color: var(--cyan);"><span>Chat Conversation Spend</span><span>💬</span></div>
+      <div class="card-value" id="kpiChatSpend">$0.0000</div>
+      <div class="card-sub" id="kpiAvgCost">Avg $0.0000 / conv</div>
     </div>
     <div class="card" style="border-color: rgba(16, 185, 129, 0.3);">
-      <div class="card-top" style="color: var(--green);"><span>Total Conversations</span><span>💬</span></div>
+      <div class="card-top" style="color: var(--green);"><span>Code Nodes & Graph</span><span>🕸️</span></div>
+      <div class="card-value" id="kpiNodesIndexed">0</div>
+      <div class="card-sub" id="kpiEdgesIndexed">0 relationships · 0 errors</div>
+    </div>
+    <div class="card">
+      <div class="card-top"><span>Conversations</span><span>💬</span></div>
       <div class="card-value" id="kpiConvs">0</div>
       <div class="card-sub" id="kpiConvsBreakdown">0 active · 0 deleted</div>
     </div>
-    <div class="card" style="border-color: rgba(168, 85, 247, 0.3);">
-      <div class="card-top" style="color: var(--purple);"><span>Total Messages</span><span>📨</span></div>
+    <div class="card">
+      <div class="card-top"><span>Total Messages</span><span>📨</span></div>
       <div class="card-value" id="kpiMsgs">0</div>
-      <div class="card-sub" id="kpiMsgsBreakdown">0 questions · 0 answers</div>
+      <div class="card-sub" id="kpiMsgsBreakdown">0 user · 0 assistant</div>
     </div>
     <div class="card">
-      <div class="card-top"><span>Unique Developers</span><span>👥</span></div>
-      <div class="card-value" id="kpiUsers">0</div>
-      <div class="card-sub">Active developer partitions</div>
+      <div class="card-top"><span>Avg Indexing Pipeline</span><span>⏳</span></div>
+      <div class="card-value" id="kpiAvgPipeline">0.0s</div>
+      <div class="card-sub" id="kpiJobsCount">0 indexing jobs run</div>
     </div>
     <div class="card">
-      <div class="card-top"><span>Avg Response Latency</span><span>⏱️</span></div>
+      <div class="card-top"><span>Avg Chat Latency</span><span>⏱️</span></div>
       <div class="card-value" id="kpiLatency">0.0s</div>
       <div class="card-sub" id="kpiLatencyMs">0 ms average</div>
-    </div>
-    <div class="card">
-      <div class="card-top"><span>Conversation Depth</span><span>🔄</span></div>
-      <div class="card-value" id="kpiDepth">0.0</div>
-      <div class="card-sub">Average turns per conversation</div>
-    </div>
-    <div class="card">
-      <div class="card-top"><span>Citations & Tools</span><span>🔍</span></div>
-      <div class="card-value" id="kpiTools">0 / 0</div>
-      <div class="card-sub">Tool calls / Citations</div>
     </div>
   </div>
 
   <!-- Navigation Tabs -->
   <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('overview')">📈 Overview & Trends</button>
-    <button class="tab-btn" onclick="switchTab('conversations')">💬 Conversations Audit</button>
-    <button class="tab-btn" onclick="switchTab('costs')">💳 Costliest LLM Turns</button>
-    <button class="tab-btn" onclick="switchTab('repos')">📁 Repositories & Developers</button>
+    <button class="tab-btn active" id="btnTabOverview" onclick="switchTab('overview')">📈 Overview & Trends</button>
+    <button class="tab-btn" id="btnTabParsing" onclick="switchTab('parsing')">⚡ Parsing & Indexing Telemetry</button>
+    <button class="tab-btn" id="btnTabConversations" onclick="switchTab('conversations')">💬 Conversations Audit</button>
+    <button class="tab-btn" id="btnTabCosts" onclick="switchTab('costs')">💳 Costliest LLM Turns</button>
+    <button class="tab-btn" id="btnTabRepos" onclick="switchTab('repos')">📁 Repositories & Developers</button>
   </div>
 
   <!-- Tab 1: Overview -->
@@ -561,7 +780,98 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Tab 2: Conversations -->
+  <!-- Tab 2: Parsing & Indexing Telemetry (NEW) -->
+  <div id="tabParsing" style="display: none;">
+    <!-- Parsing Summary Subcards -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px;">
+      <div class="card" style="border-left: 3px solid var(--purple);">
+        <div class="card-top"><span>Indexing Jobs Health</span><span>📦</span></div>
+        <div class="card-value" id="parseJobsHealth">0 / 0</div>
+        <div class="card-sub" id="parseJobsHealthSub">0 completed · 0 failed · 0 running</div>
+      </div>
+      <div class="card" style="border-left: 3px solid var(--green);">
+        <div class="card-top"><span>AST Parse Health</span><span>🛡️</span></div>
+        <div class="card-value" id="parseErrorsTotal" style="color: var(--green);">0 Errors</div>
+        <div class="card-sub" id="parseErrorsSub">100% clean AST tree extraction</div>
+      </div>
+      <div class="card" style="border-left: 3px solid var(--cyan);">
+        <div class="card-top"><span>Token Breakdown</span><span>🪙</span></div>
+        <div class="card-value" id="parseTotalTokens">0</div>
+        <div class="card-sub" id="parseTokensSub">0 LLM tokens · 0 Embedding tokens</div>
+      </div>
+      <div class="card" style="border-left: 3px solid var(--orange);">
+        <div class="card-top"><span>Model Cost Ratio</span><span>⚖️</span></div>
+        <div class="card-value" id="parseModelRatio">$0.00 / $0.00</div>
+        <div class="card-sub">gpt-4o-mini actual vs gpt-4o comparison</div>
+      </div>
+    </div>
+
+    <!-- Pipeline Stage Latency Breakdown -->
+    <div class="card" style="margin-bottom: 24px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px;">
+        <div>
+          <h3 style="font-size: 15px;">Pipeline Stage Latency & Duration Breakdown</h3>
+          <p style="font-size: 12px; color: var(--muted);">Average execution time and proportional runtime across 7-stage indexing pipeline</p>
+        </div>
+        <span class="pill pill-purple">7-Stage Micro-Pipeline</span>
+      </div>
+      <div id="stagesContainer" style="display: flex; flex-direction: column; gap: 12px;"></div>
+    </div>
+
+    <!-- Active Repositories Indexed in Knowledge Graph -->
+    <div class="card" style="margin-bottom: 24px;">
+      <h3 style="font-size: 15px; margin-bottom: 4px;">Knowledge Graph Repositories</h3>
+      <p style="font-size: 12px; color: var(--muted); margin-bottom: 16px;">Current active repositories parsed into Neo4j graph and Milvus vector collections</p>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Repository</th>
+              <th>Cluster</th>
+              <th>Branch</th>
+              <th>Graph Nodes</th>
+              <th>Relationships</th>
+              <th>Est. Index Spend</th>
+              <th>Last Indexed</th>
+            </tr>
+          </thead>
+          <tbody id="reposIndexedTbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Indexing Jobs Audit Table -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
+        <div>
+          <h3 style="font-size: 15px;">Indexing Jobs Execution Audit</h3>
+          <p style="font-size: 12px; color: var(--muted);">Comprehensive record of all indexing pipeline triggers, durations, and costs</p>
+        </div>
+        <input type="text" id="jobFilter" placeholder="Filter jobs by repo or status…" oninput="renderJobsTable()" style="padding: 8px 12px; border-radius: 8px; background: rgba(255,255,255,0.04); border: 1px solid var(--card-border); color: #fff; font-size: 12px; width: 280px; outline: none;">
+      </div>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Job ID</th>
+              <th>Repository</th>
+              <th>Cluster</th>
+              <th>Nodes</th>
+              <th>Relationships</th>
+              <th>Parse Errors</th>
+              <th>Duration</th>
+              <th>Est. Spend ($)</th>
+              <th>Status</th>
+              <th>Started</th>
+            </tr>
+          </thead>
+          <tbody id="jobsAuditTbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 3: Conversations -->
   <div id="tabConversations" style="display: none;">
     <div class="card">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
@@ -591,7 +901,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Tab 3: Costliest Turns -->
+  <!-- Tab 4: Costliest Turns -->
   <div id="tabCosts" style="display: none;">
     <div class="card">
       <h3 style="font-size: 15px; margin-bottom: 4px;">Costliest & Slowest LLM Turns</h3>
@@ -615,12 +925,12 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Tab 4: Repositories & Developers -->
+  <!-- Tab 5: Repositories & Developers -->
   <div id="tabRepos" style="display: none;">
     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
       <div class="card">
-        <h3 style="font-size: 15px; margin-bottom: 4px;">Top Repositories</h3>
-        <p style="font-size: 12px; color: var(--muted); margin-bottom: 16px;">Sessions and tokens per codebase</p>
+        <h3 style="font-size: 15px; margin-bottom: 4px;">Top Repositories (Chat Activity)</h3>
+        <p style="font-size: 12px; color: var(--muted); margin-bottom: 16px;">Sessions and tokens consumed per codebase</p>
         <div id="reposContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
       </div>
 
@@ -657,12 +967,34 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
         '<code class="mono" style="color: var(--purple);">messages</code> (' + d.database.messages_count + ')';
       document.getElementById('dbEndpoint').textContent = 'Backend: ' + d.database.endpoint;
 
-      // KPIs
-      document.getElementById('kpiCost').textContent = '$' + d.overview.total_cost.toFixed(4);
+      // Parser status pill
+      const p = d.parsing || {};
+      const parserPill = document.getElementById('parserStatusPill');
+      if (p.is_connected) {
+        parserPill.textContent = '⚡ Parser Online (' + p.total_jobs + ' jobs)';
+        parserPill.className = 'pill pill-green';
+        document.getElementById('parserEndpoint').textContent = 'Parser: ' + p.endpoint;
+      } else {
+        parserPill.textContent = '⚡ Parser Offline';
+        parserPill.className = 'pill pill-red';
+      }
+
+      // Top KPIs
+      const combSpend = d.overview.combined_platform_spend || (d.overview.total_cost + (p.costs ? p.costs.total_cost : 0));
+      document.getElementById('kpiTotalPlatformSpend').textContent = '$' + combSpend.toFixed(4);
+      document.getElementById('kpiPlatformSpendBreakdown').textContent = 
+        'Chat: $' + d.overview.total_cost.toFixed(4) + ' · Parsing: $' + (p.costs ? p.costs.total_cost.toFixed(4) : '0.00');
+
+      document.getElementById('kpiParsingSpend').textContent = '$' + (p.costs ? p.costs.total_cost.toFixed(4) : '0.00');
+      document.getElementById('kpiParsingTokens').textContent = 
+        (p.tokens ? p.tokens.total_tokens.toLocaleString() : '0') + ' tokens · ' + (p.costs ? p.costs.llm_model : 'gpt-4o-mini');
+
+      document.getElementById('kpiChatSpend').textContent = '$' + d.overview.total_cost.toFixed(4);
       document.getElementById('kpiAvgCost').textContent = 'Avg $' + d.overview.avg_cost_per_conv + ' / conv';
 
-      document.getElementById('kpiTokens').textContent = d.overview.total_tokens.toLocaleString();
-      document.getElementById('kpiTokensBreakdown').textContent = d.overview.total_input_tokens.toLocaleString() + ' in · ' + d.overview.total_output_tokens.toLocaleString() + ' out';
+      document.getElementById('kpiNodesIndexed').textContent = (p.total_nodes_indexed || 0).toLocaleString();
+      document.getElementById('kpiEdgesIndexed').textContent = 
+        (p.total_relationships || 0).toLocaleString() + ' relationships · ' + (p.total_parse_errors || 0) + ' errors';
 
       document.getElementById('kpiConvs').textContent = d.overview.total_conversations;
       document.getElementById('kpiConvsBreakdown').textContent = d.overview.active_conversations + ' active · ' + d.overview.deleted_conversations + ' soft-deleted';
@@ -670,29 +1002,28 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('kpiMsgs').textContent = d.overview.total_messages;
       document.getElementById('kpiMsgsBreakdown').textContent = d.overview.user_messages + ' user · ' + d.overview.assistant_messages + ' assistant';
 
-      document.getElementById('kpiUsers').textContent = d.overview.total_unique_users;
+      document.getElementById('kpiAvgPipeline').textContent = (p.avg_pipeline_duration_s || 0).toFixed(1) + 's';
+      document.getElementById('kpiJobsCount').textContent = (p.total_jobs || 0) + ' indexing jobs run';
+
       document.getElementById('kpiLatency').textContent = (d.overview.avg_latency_ms / 1000).toFixed(2) + 's';
       document.getElementById('kpiLatencyMs').textContent = d.overview.avg_latency_ms.toLocaleString() + ' ms average';
 
-      document.getElementById('kpiDepth').textContent = d.overview.avg_turns_per_conv;
-      document.getElementById('kpiTools').textContent = d.overview.total_tool_calls + ' / ' + d.overview.total_citations;
-
-      // Timeline
+      // Render Tab 1: Overview Timeline
       const tContainer = document.getElementById('timelineContainer');
       if (d.timeline.length === 0) {
         tContainer.innerHTML = '<div style="color: var(--faint); font-size: 12px;">No historical records yet.</div>';
       } else {
-        const maxTokens = Math.max(...d.timeline.map(p => p.tokens), 1);
-        tContainer.innerHTML = d.timeline.map(p => {
-          const pct = Math.min(100, Math.max(8, (p.tokens / maxTokens) * 100));
+        const maxTokens = Math.max(...d.timeline.map(x => x.tokens), 1);
+        tContainer.innerHTML = d.timeline.map(x => {
+          const pct = Math.min(100, Math.max(8, (x.tokens / maxTokens) * 100));
           return `
             <div style="display: flex; align-items: center; gap: 10px; font-size: 12px;">
-              <span class="mono" style="width: 85px; color: var(--muted);">${p.date}</span>
-              <div style="flex: 1; background: rgba(255,255,255,0.04); height: 24px; border-radius: 4px; overflow: hidden; padding: 0 4px; display: flex; align-items: center;">
-                <div style="width: ${pct}%; height: 100%; background: linear-gradient(90deg, #0078d4, #38bdf8); border-radius: 3px;"></div>
+              <span class="mono" style="width: 85px; color: var(--muted);">${x.date}</span>
+              <div class="bar-wrapper" style="flex: 1;">
+                <div class="bar-fill" style="width: ${pct}%; background: linear-gradient(90deg, #0078d4, #38bdf8);"></div>
               </div>
-              <span class="mono" style="width: 90px; text-align: right; font-weight: 600;">${p.tokens.toLocaleString()} toks</span>
-              <span class="mono" style="width: 70px; text-align: right; color: var(--orange);">$${p.cost.toFixed(4)}</span>
+              <span class="mono" style="width: 90px; text-align: right; font-weight: 600;">${x.tokens.toLocaleString()} toks</span>
+              <span class="mono" style="width: 70px; text-align: right; color: var(--orange);">$${x.cost.toFixed(4)}</span>
             </div>
           `;
         }).join('');
@@ -714,9 +1045,13 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       `).join('');
 
+      // Render Tab 2: Parsing Telemetry
+      renderParsingTab(p);
+
+      // Render Tab 3: Conversations
       renderConversations();
 
-      // Costliest
+      // Render Tab 4: Costliest turns
       const cTbody = document.getElementById('costliestTbody');
       cTbody.innerHTML = d.costliest_turns.map(t => `
         <tr>
@@ -730,7 +1065,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
         </tr>
       `).join('');
 
-      // Repos
+      // Render Tab 5: Repos & Users
       const rContainer = document.getElementById('reposContainer');
       rContainer.innerHTML = d.repositories.map(r => `
         <div style="padding: 12px 14px; border-radius: 8px; background: rgba(255,255,255,0.02); border: 1px solid var(--card-border); display: flex; justify-content: space-between; align-items: center;">
@@ -742,7 +1077,6 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       `).join('');
 
-      // Users
       const uContainer = document.getElementById('usersContainer');
       uContainer.innerHTML = d.users.map(u => `
         <div style="padding: 12px 14px; border-radius: 8px; background: rgba(255,255,255,0.02); border: 1px solid var(--card-border); display: flex; justify-content: space-between; align-items: center;">
@@ -753,6 +1087,136 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="mono" style="font-weight: 700; color: var(--orange);">$${u.total_cost.toFixed(4)}</div>
         </div>
       `).join('');
+    }
+
+    function renderParsingTab(p) {
+      if (!p) return;
+
+      // Parsing subcards
+      document.getElementById('parseJobsHealth').textContent = p.completed_jobs + ' / ' + p.total_jobs;
+      document.getElementById('parseJobsHealthSub').textContent = 
+        p.completed_jobs + ' completed · ' + p.failed_jobs + ' failed · ' + p.running_jobs + ' running';
+
+      const errs = p.total_parse_errors || 0;
+      const errElem = document.getElementById('parseErrorsTotal');
+      errElem.textContent = errs === 0 ? '0 Errors' : errs + ' Errors';
+      errElem.style.color = errs === 0 ? 'var(--green)' : 'var(--red)';
+      document.getElementById('parseErrorsSub').textContent = 
+        errs === 0 ? '100% clean AST tree extraction across all files' : errs + ' file syntax/parse exceptions';
+
+      const pToks = p.tokens || {};
+      document.getElementById('parseTotalTokens').textContent = (pToks.total_tokens || 0).toLocaleString();
+      document.getElementById('parseTokensSub').textContent = 
+        (pToks.llm_total_tokens || 0).toLocaleString() + ' LLM toks · ' + (pToks.embedding_tokens || 0).toLocaleString() + ' Emb toks';
+
+      const pCosts = p.costs || {};
+      document.getElementById('parseModelRatio').textContent = 
+        '$' + (pCosts.total_cost || 0).toFixed(4) + ' / $' + (pCosts.gpt4o_comparison_spend || 0).toFixed(4);
+
+      // Pipeline stages breakdown
+      const stagesContainer = document.getElementById('stagesContainer');
+      const stages = p.stages || [];
+      if (stages.length === 0) {
+        stagesContainer.innerHTML = '<div style="color: var(--faint); font-size: 12px;">No stage execution records found.</div>';
+      } else {
+        const stageColors = {
+          'Git Clone': '#38bdf8',
+          'AST Parsing': '#10b981',
+          'Graph Building': '#0078d4',
+          'Neo4j Write': '#f59e0b',
+          'Cross-Repo Linking': '#a855f7',
+          'LLM Descriptions': '#f97316',
+          'Milvus Embeddings': '#ec4899',
+        };
+
+        stagesContainer.innerHTML = stages.map(s => {
+          const col = stageColors[s.name] || '#38bdf8';
+          const pctWidth = Math.max(6, Math.min(100, s.percentage));
+          return `
+            <div style="display: flex; flex-direction: column; gap: 4px; font-size: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-weight: 600; color: ${col}; display: flex; align-items: center; gap: 6px;">
+                  <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: ${col};"></span>
+                  ${s.name}
+                </span>
+                <span class="mono" style="color: var(--muted); font-size: 11px;">
+                  avg <strong>${s.avg_duration_s.toFixed(2)}s</strong> (total ${s.total_duration_s.toFixed(1)}s over ${s.run_count} runs) · <strong style="color: #fff;">${s.percentage}%</strong>
+                </span>
+              </div>
+              <div class="bar-wrapper">
+                <div class="bar-fill" style="width: ${pctWidth}%; background: ${col};"></div>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+
+      // Repositories in graph table
+      const reposTbody = document.getElementById('reposIndexedTbody');
+      const repos = p.repos || [];
+      if (repos.length === 0) {
+        reposTbody.innerHTML = '<tr><td colspan="7" style="color: var(--faint);">No active repositories indexed.</td></tr>';
+      } else {
+        reposTbody.innerHTML = repos.map(r => {
+          const spend = ((r.node_count || 0) * 0.000058).toFixed(4);
+          const dt = r.indexed_at ? new Date(r.indexed_at * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '—';
+          return `
+            <tr>
+              <td class="mono" style="color: var(--cyan); font-weight: 600;">${r.repository_id}</td>
+              <td><span class="pill pill-blue">${r.cluster_id || 'default'}</span></td>
+              <td class="mono" style="color: var(--muted);">${r.branch || 'main'}</td>
+              <td class="mono" style="font-weight: 600;">${(r.node_count || 0).toLocaleString()}</td>
+              <td class="mono" style="color: var(--muted);">${(r.relationship_count || 0).toLocaleString()}</td>
+              <td class="mono" style="color: var(--orange); font-weight: 600;">$${spend}</td>
+              <td style="font-size: 11px; color: var(--muted);">${dt}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      renderJobsTable();
+    }
+
+    function renderJobsTable() {
+      if (!globalData || !globalData.parsing) return;
+      const q = (document.getElementById('jobFilter').value || '').toLowerCase().trim();
+      let jobs = globalData.parsing.jobs || [];
+      if (q) {
+        jobs = jobs.filter(j => 
+          (j.repository_id || '').toLowerCase().includes(q) ||
+          (j.cluster_id || '').toLowerCase().includes(q) ||
+          (j.status || '').toLowerCase().includes(q) ||
+          (j.job_id || '').toLowerCase().includes(q)
+        );
+      }
+      const tbody = document.getElementById('jobsAuditTbody');
+      if (jobs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" style="color: var(--faint);">No matching indexing jobs found.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = jobs.map(j => {
+        const shortId = (j.job_id || '').slice(0, 8);
+        const stPill = j.status === 'done' ? 'pill-green' : (j.status === 'failed' ? 'pill-red' : 'pill-orange');
+        const dt = j.created_at ? new Date(j.created_at * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '—';
+        return `
+          <tr>
+            <td class="mono" style="color: var(--muted); font-size: 11px;" title="${j.job_id}">${shortId}…</td>
+            <td class="mono" style="font-weight: 500; color: var(--cyan);">${j.repository_id}</td>
+            <td><span class="pill pill-blue" style="font-size: 9px;">${j.cluster_id || 'default'}</span></td>
+            <td class="mono" style="font-weight: 600;">${(j.node_count || 0).toLocaleString()}</td>
+            <td class="mono" style="color: var(--muted);">${(j.relationship_count || 0).toLocaleString()}</td>
+            <td>
+              <span class="pill ${j.parse_errors > 0 ? 'pill-red' : 'pill-green'}" style="font-size: 10px;">
+                ${j.parse_errors} errors
+              </span>
+            </td>
+            <td class="mono">${j.duration_s ? j.duration_s + 's' : '—'}</td>
+            <td class="mono" style="color: var(--orange); font-weight: 600;">$${(j.estimated_cost || 0).toFixed(4)}</td>
+            <td><span class="pill ${stPill}">${j.status || 'queued'}</span></td>
+            <td style="font-size: 11px; color: var(--muted);">${dt}</td>
+          </tr>
+        `;
+      }).join('');
     }
 
     function renderConversations() {
@@ -790,9 +1254,19 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
 
     function switchTab(tabId) {
       document.querySelectorAll('.tabs .tab-btn').forEach(btn => btn.classList.remove('active'));
-      event.target.classList.add('active');
+      
+      const tabBtnMap = {
+        'overview': 'btnTabOverview',
+        'parsing': 'btnTabParsing',
+        'conversations': 'btnTabConversations',
+        'costs': 'btnTabCosts',
+        'repos': 'btnTabRepos'
+      };
+      const activeBtn = document.getElementById(tabBtnMap[tabId]);
+      if (activeBtn) activeBtn.classList.add('active');
 
       document.getElementById('tabOverview').style.display = tabId === 'overview' ? 'block' : 'none';
+      document.getElementById('tabParsing').style.display = tabId === 'parsing' ? 'block' : 'none';
       document.getElementById('tabConversations').style.display = tabId === 'conversations' ? 'block' : 'none';
       document.getElementById('tabCosts').style.display = tabId === 'costs' ? 'block' : 'none';
       document.getElementById('tabRepos').style.display = tabId === 'repos' ? 'block' : 'none';
