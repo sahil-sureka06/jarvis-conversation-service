@@ -100,6 +100,13 @@ class ConversationService:
             total_toks = 0
             cost = 0.0
 
+        # Extract telemetry & metadata early
+        citations_list = payload.citations or (payload.payload.metadata.citations if payload.payload and payload.payload.metadata else []) or []
+        tools_list = payload.tool_calls or (payload.payload.metadata.tool_calls if payload.payload and payload.payload.metadata else []) or []
+        latency_val = payload.latency_ms if payload.latency_ms is not None else (payload.payload.metadata.latency_ms if payload.payload and payload.payload.metadata else None)
+        model_val = payload.model if payload.model is not None else (payload.payload.metadata.model if payload.payload and payload.payload.metadata else ("gpt-4o" if payload.role == "assistant" else None))
+        thinking_val = payload.thinking or (payload.payload.metadata.thinking if payload.payload and payload.payload.metadata else None)
+
         if not conv:
             # First message creates the conversation document in Cosmos DB
             title = payload.title
@@ -122,6 +129,8 @@ class ConversationService:
                 "total_output_tokens": output_toks,
                 "total_tokens": total_toks,
                 "total_cost": round(cost, 6),
+                "total_tool_calls": len(tools_list),
+                "total_citations": len(citations_list),
                 "first_message_at": now,
                 "last_message_at": now,
                 "duration_ms": 0,
@@ -142,20 +151,15 @@ class ConversationService:
 
             conv["turn_count"] = max(conv.get("turn_count", 0), (seq_num + 1) // 2)
 
-            # Cumulative tokens & cost
+            # Cumulative tokens, cost, citations, tools
             conv["total_input_tokens"] = conv.get("total_input_tokens", 0) + input_toks
             conv["total_output_tokens"] = conv.get("total_output_tokens", 0) + output_toks
             conv["total_tokens"] = conv.get("total_tokens", 0) + total_toks
             conv["total_cost"] = round(conv.get("total_cost", 0.0) + cost, 6)
+            conv["total_tool_calls"] = conv.get("total_tool_calls", 0) + len(tools_list)
+            conv["total_citations"] = conv.get("total_citations", 0) + len(citations_list)
 
             self.db.upsert_conversation(conv)
-
-        # Extract telemetry & metadata
-        citations_list = payload.citations or (payload.payload.metadata.citations if payload.payload and payload.payload.metadata else []) or []
-        tools_list = payload.tool_calls or (payload.payload.metadata.tool_calls if payload.payload and payload.payload.metadata else []) or []
-        latency_val = payload.latency_ms if payload.latency_ms is not None else (payload.payload.metadata.latency_ms if payload.payload and payload.payload.metadata else None)
-        model_val = payload.model if payload.model is not None else (payload.payload.metadata.model if payload.payload and payload.payload.metadata else ("gpt-4o" if payload.role == "assistant" else None))
-        thinking_val = payload.thinking or (payload.payload.metadata.thinking if payload.payload and payload.payload.metadata else None)
 
         metadata_dict: Dict[str, Any] = {
             "citations_count": len(citations_list),

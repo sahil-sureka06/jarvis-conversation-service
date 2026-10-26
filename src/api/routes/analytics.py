@@ -45,7 +45,7 @@ def fetch_parsing_metrics() -> Dict[str, Any]:
         with urllib.request.urlopen(req, timeout=2.5) as resp:
             jobs = json.loads(resp.read().decode("utf-8"))
         is_connected = True
-    except Exception as e:
+    except Exception:
         jobs = []
 
     # 2. Fetch indexed repos
@@ -56,7 +56,7 @@ def fetch_parsing_metrics() -> Dict[str, Any]:
         )
         with urllib.request.urlopen(req2, timeout=2.5) as resp2:
             repos = json.loads(resp2.read().decode("utf-8"))
-    except Exception as e:
+    except Exception:
         repos = []
 
     total_jobs = len(jobs)
@@ -68,12 +68,6 @@ def fetch_parsing_metrics() -> Dict[str, Any]:
     total_edges = sum(j.get("relationship_count") or 0 for j in jobs)
     total_errors = sum(j.get("parse_errors") or 0 for j in jobs)
 
-    # Cost model:
-    # LLM descriptions: ~200 input tokens, ~40 output tokens per node
-    # gpt-4o-mini rates: $0.150/1M in ($0.00003), $0.600/1M out ($0.000024) = $0.000054 / node
-    # Milvus embeddings (text-embedding-3-small): ~200 tokens/node @ $0.02/1M = $0.000004 / node
-    # Total actual per node = $0.000058
-    # For comparison, gpt-4o rates ($2.50 in, $10.00 out) = $0.000904 / node
     total_llm_input_tokens = total_nodes * 200
     total_llm_output_tokens = total_nodes * 40
     total_llm_tokens = total_llm_input_tokens + total_llm_output_tokens
@@ -85,7 +79,6 @@ def fetch_parsing_metrics() -> Dict[str, Any]:
     total_parsing_cost = round(llm_spend + embedding_spend, 5)
     total_gpt4o_spend = round(total_nodes * 0.000904, 5)
 
-    # Stage averages & total durations
     stage_totals: Dict[str, float] = {}
     stage_counts: Dict[str, int] = {}
     job_durations: List[float] = []
@@ -139,13 +132,11 @@ def fetch_parsing_metrics() -> Dict[str, Any]:
 
     total_pipeline_time = sum(stage_totals.values())
     stage_breakdown: List[Dict[str, Any]] = []
-    # Standard stage order
     stage_order = [
         "Git Clone", "AST Parsing", "Graph Building",
         "Neo4j Write", "Cross-Repo Linking", "LLM Descriptions", "Milvus Embeddings"
     ]
     all_stage_names = list(stage_totals.keys())
-    # Sort by standard order if known
     sorted_stages = sorted(
         all_stage_names,
         key=lambda x: stage_order.index(x) if x in stage_order else 99
@@ -222,15 +213,14 @@ async def get_analytics_summary(
     total_tokens = sum(c.get("total_tokens", 0) for c in conversations)
     total_cost = sum(c.get("total_cost", 0.0) for c in conversations)
 
-    # Unique users
     unique_users = set(c.get("user_id") for c in conversations if c.get("user_id"))
 
-    # Latency, tool calls, citations
     latencies: List[int] = []
     total_tool_calls = 0
     total_citations = 0
+    tools_frequency: Dict[str, int] = defaultdict(int)
+    citations_frequency: Dict[str, int] = defaultdict(int)
 
-    # Models breakdown
     models_usage: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
         "call_count": 0,
         "input_tokens": 0,
@@ -240,7 +230,6 @@ async def get_analytics_summary(
         "latencies": [],
     })
 
-    # Timeline daily aggregation (last 14 days)
     daily_timeline: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
         "date": "",
         "conversations": 0,
@@ -249,7 +238,6 @@ async def get_analytics_summary(
         "cost": 0.0,
     })
 
-    # Repositories breakdown
     repo_usage: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
         "repository_id": "",
         "conversation_count": 0,
@@ -257,7 +245,6 @@ async def get_analytics_summary(
         "total_cost": 0.0,
     })
 
-    # User breakdown
     users_usage: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
         "user_id": "",
         "conversation_count": 0,
@@ -267,7 +254,6 @@ async def get_analytics_summary(
     })
 
     for c in conversations:
-        # User agg
         u_id = c.get("user_id") or "anonymous"
         users_usage[u_id]["user_id"] = u_id
         users_usage[u_id]["conversation_count"] += 1
@@ -275,7 +261,6 @@ async def get_analytics_summary(
         users_usage[u_id]["total_cost"] += c.get("total_cost", 0.0)
         users_usage[u_id]["last_active"] = max(users_usage[u_id]["last_active"], c.get("updated_at", 0))
 
-        # Repos agg
         rep_ids = c.get("repository_ids", [])
         for r in rep_ids:
             if r:
@@ -284,7 +269,6 @@ async def get_analytics_summary(
                 repo_usage[r]["total_tokens"] += c.get("total_tokens", 0)
                 repo_usage[r]["total_cost"] += c.get("total_cost", 0.0)
 
-        # Daily timeline agg
         created_ts = c.get("created_at") or 0
         if created_ts > 0:
             date_str = datetime.fromtimestamp(created_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -304,9 +288,37 @@ async def get_analytics_summary(
         if lat and isinstance(lat, (int, float)) and lat > 0:
             latencies.append(int(lat))
 
-        # Tool calls & citations
-        total_tool_calls += meta.get("tool_calls_count", 0)
-        total_citations += meta.get("citations_count", 0)
+        # Tool calls & citations extraction and accurate aggregation
+        tools_list = meta.get("tool_calls") or payload.get("tool_calls") or m.get("tool_calls") or []
+        citations_list = meta.get("citations") or payload.get("citations") or m.get("citations") or []
+
+        tc_count = meta.get("tool_calls_count")
+        if tc_count is None or tc_count == 0:
+            tc_count = len(tools_list)
+        total_tool_calls += tc_count
+
+        cit_count = meta.get("citations_count")
+        if cit_count is None or cit_count == 0:
+            cit_count = len(citations_list)
+        total_citations += cit_count
+
+        for t in tools_list:
+            if isinstance(t, dict):
+                t_name = t.get("name") or t.get("tool_name") or "tool"
+                tools_frequency[t_name] += 1
+            elif isinstance(t, str):
+                tools_frequency[t] += 1
+
+        for cit in citations_list:
+            if isinstance(cit, dict):
+                raw_f = cit.get("file") or cit.get("file_path") or cit.get("element_name")
+                if raw_f:
+                    f_str = str(raw_f)
+                    if ".jarvis_workspace" in f_str:
+                        parts = f_str.split(".jarvis_workspace/")
+                        if len(parts) > 1 and "/" in parts[1]:
+                            f_str = parts[1].split("/", 1)[1]
+                    citations_frequency[f_str] += 1
 
         # Model stats
         model = meta.get("model") or "gpt-4o"
@@ -323,7 +335,6 @@ async def get_analytics_summary(
         if lat:
             models_usage[model]["latencies"].append(lat)
 
-        # Message timeline
         msg_ts = m.get("created_at") or 0
         if msg_ts > 0:
             date_str = datetime.fromtimestamp(msg_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -339,7 +350,6 @@ async def get_analytics_summary(
         if total_convs else 0.0
     )
 
-    # Format models summary
     models_summary = []
     for model_name, m_data in models_usage.items():
         m_lats = m_data.pop("latencies", [])
@@ -349,24 +359,20 @@ async def get_analytics_summary(
         models_summary.append(m_data)
     models_summary.sort(key=lambda x: x["call_count"], reverse=True)
 
-    # Format timeline (sorted chronologically)
     timeline_list = sorted(daily_timeline.values(), key=lambda x: x["date"])
     for item in timeline_list:
         item["cost"] = round(item["cost"], 5)
 
-    # Format repositories
     repos_summary = list(repo_usage.values())
     for r in repos_summary:
         r["total_cost"] = round(r["total_cost"], 5)
     repos_summary.sort(key=lambda x: x["conversation_count"], reverse=True)
 
-    # Format users
     users_summary = list(users_usage.values())
     for u in users_summary:
         u["total_cost"] = round(u["total_cost"], 5)
     users_summary.sort(key=lambda x: x["total_cost"], reverse=True)
 
-    # Top costliest assistant responses
     costliest_turns = []
     for m in messages:
         if m.get("role") == "assistant":
@@ -375,6 +381,8 @@ async def get_analytics_summary(
             mt = pl.get("metadata") or {}
             cst = st.get("cost", 0.0)
             if cst > 0 or st.get("total_tokens", 0) > 0:
+                t_list = mt.get("tool_calls") or pl.get("tool_calls") or []
+                c_list = mt.get("citations") or pl.get("citations") or []
                 costliest_turns.append({
                     "msg_id": m.get("msg_id") or m.get("id"),
                     "conversation_id": m.get("conversation_id"),
@@ -384,22 +392,39 @@ async def get_analytics_summary(
                     "output_tokens": st.get("output_tokens", 0),
                     "latency_ms": mt.get("latency_ms"),
                     "model": mt.get("model", "gpt-4o"),
+                    "tool_calls_count": mt.get("tool_calls_count", len(t_list)),
+                    "citations_count": mt.get("citations_count", len(c_list)),
+                    "tool_names": [t.get("name") if isinstance(t, dict) else str(t) for t in t_list],
                     "created_at": m.get("created_at"),
                 })
     costliest_turns.sort(key=lambda x: x["cost"], reverse=True)
     costliest_turns = costliest_turns[:10]
 
-    # Recent conversations
     recent_convs = []
     for c in conversations[:20]:
+        conv_id = c.get("conversation_id") or c.get("id")
+        conv_tools = c.get("total_tool_calls")
+        if conv_tools is None:
+            conv_tools = sum(
+                (msg.get("payload", {}).get("metadata", {}).get("tool_calls_count") or len(msg.get("payload", {}).get("metadata", {}).get("tool_calls", [])))
+                for msg in messages if msg.get("conversation_id") == conv_id
+            )
+        conv_cits = c.get("total_citations")
+        if conv_cits is None:
+            conv_cits = sum(
+                (msg.get("payload", {}).get("metadata", {}).get("citations_count") or len(msg.get("payload", {}).get("metadata", {}).get("citations", [])))
+                for msg in messages if msg.get("conversation_id") == conv_id
+            )
         recent_convs.append({
-            "conversation_id": c.get("conversation_id") or c.get("id"),
+            "conversation_id": conv_id,
             "user_id": c.get("user_id"),
             "title": c.get("title"),
             "repository_ids": c.get("repository_ids", []),
             "turn_count": c.get("turn_count", 0),
             "total_tokens": c.get("total_tokens", 0),
             "total_cost": round(c.get("total_cost", 0.0), 5),
+            "total_tool_calls": conv_tools,
+            "total_citations": conv_cits,
             "status": c.get("status", "active"),
             "is_deleted": c.get("is_deleted", False),
             "created_at": c.get("created_at"),
@@ -411,9 +436,14 @@ async def get_analytics_summary(
     parsing_spend = parsing_metrics.get("costs", {}).get("total_cost", 0.0)
     parsing_tokens = parsing_metrics.get("tokens", {}).get("total_tokens", 0)
 
-    # Combined platform aggregates
     combined_platform_spend = round(total_cost + parsing_spend, 5)
     combined_platform_tokens = total_tokens + parsing_tokens
+
+    top_citations_list = sorted(
+        [{"file": k, "count": v} for k, v in citations_frequency.items()],
+        key=lambda x: x["count"],
+        reverse=True
+    )[:15]
 
     return {
         "overview": {
@@ -436,6 +466,8 @@ async def get_analytics_summary(
             "avg_turns_per_conv": avg_turns_per_conv,
             "total_tool_calls": total_tool_calls,
             "total_citations": total_citations,
+            "tools_breakdown": dict(tools_frequency),
+            "top_citations": top_citations_list,
             # Platform overall
             "combined_platform_spend": combined_platform_spend,
             "combined_platform_tokens": combined_platform_tokens,
@@ -470,7 +502,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>JARVIS Admin Analytics Portal — Cosmos DB & Indexing Telemetry</title>
+  <title>JARVIS Platform Telemetry & Analytics</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -487,6 +519,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       --red: #ef4444;
       --cyan: #38bdf8;
       --amber: #f59e0b;
+      --indigo: #6366f1;
       --text: #f0f3f8;
       --muted: #8b949e;
       --faint: #586069;
@@ -534,6 +567,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     .pill-green { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
     .pill-orange { background: rgba(249, 115, 22, 0.15); color: var(--orange); border: 1px solid rgba(249, 115, 22, 0.3); }
     .pill-purple { background: rgba(168, 85, 247, 0.15); color: var(--purple); border: 1px solid rgba(168, 85, 247, 0.3); }
+    .pill-indigo { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); }
     .pill-red { background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }
     
     .status-bar {
@@ -570,7 +604,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
 
     .grid-kpis {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
       gap: 16px;
       margin-bottom: 28px;
     }
@@ -593,7 +627,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--muted);
     }
     .card-value {
-      font-size: 28px;
+      font-size: 26px;
       font-weight: 700;
       letter-spacing: -0.5px;
       color: #fff;
@@ -657,7 +691,6 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     tr:hover td { background: rgba(255, 255, 255, 0.02); }
     code, .mono { font-family: 'Fira Code', monospace; }
 
-    /* Progress & bar charts */
     .bar-wrapper {
       background: rgba(255, 255, 255, 0.04);
       height: 24px;
@@ -685,7 +718,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
         <span class="pill pill-green" id="parserStatusPill">⚡ Parser Online</span>
       </div>
       <p style="font-size: 13px; color: var(--muted);">
-        Enterprise analytics dashboard monitoring conversational sessions, code graph indexing, pipeline latencies, token consumption, and cost distributions.
+        Enterprise analytics dashboard monitoring conversational sessions, code graph indexing, citations, autonomous tool calls, and platform spend.
       </p>
     </div>
 
@@ -710,7 +743,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="mono" style="font-size: 11px; color: var(--faint);" id="dbEndpoint">Endpoint: Local / Azure Cosmos DB</div>
   </div>
 
-  <!-- Primary Top KPI Grid -->
+  <!-- Primary Top KPI Grid (9 Metric Cards) -->
   <div class="grid-kpis" id="kpiGrid">
     <div class="card" style="border-color: rgba(249, 115, 22, 0.4); background: linear-gradient(180deg, rgba(249,115,22,0.06), var(--card-bg));">
       <div class="card-top" style="color: var(--orange);"><span>Total Platform Investment</span><span>💰</span></div>
@@ -726,6 +759,11 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="card-top" style="color: var(--cyan);"><span>Chat Conversation Spend</span><span>💬</span></div>
       <div class="card-value" id="kpiChatSpend">$0.0000</div>
       <div class="card-sub" id="kpiAvgCost">Avg $0.0000 / conv</div>
+    </div>
+    <div class="card" style="border-color: rgba(56, 189, 248, 0.35);">
+      <div class="card-top" style="color: var(--cyan);"><span>Tool Calls & Citations</span><span>🔍</span></div>
+      <div class="card-value"><span id="kpiTools">0</span> <span style="font-size: 16px; color: var(--muted);">calls</span> · <span id="kpiCitations" style="color: var(--orange);">0</span> <span style="font-size: 16px; color: var(--muted);">cites</span></div>
+      <div class="card-sub" id="kpiToolsSub">Autonomous executions & code provenance</div>
     </div>
     <div class="card" style="border-color: rgba(16, 185, 129, 0.3);">
       <div class="card-top" style="color: var(--green);"><span>Code Nodes & Graph</span><span>🕸️</span></div>
@@ -778,11 +816,31 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="modelsContainer" style="display: flex; flex-direction: column; gap: 12px;"></div>
       </div>
     </div>
+
+    <!-- Dual-Card: Tool Invocations & Citations Intelligence Grid -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px;">
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+          <h3 style="font-size: 15px;">Autonomous Tool Invocations</h3>
+          <span class="pill pill-purple" id="totalToolsBadge">0 calls</span>
+        </div>
+        <p style="font-size: 12px; color: var(--muted); margin-bottom: 16px;">Agent ReAct tool usage frequency across conversations</p>
+        <div id="toolsContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
+      </div>
+
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+          <h3 style="font-size: 15px;">Source Code Citations & Provenance</h3>
+          <span class="pill pill-orange" id="totalCitationsBadge">0 cites</span>
+        </div>
+        <p style="font-size: 12px; color: var(--muted); margin-bottom: 16px;">Most frequently referenced source files and code entities</p>
+        <div id="citationsContainer" style="display: flex; flex-direction: column; gap: 10px;"></div>
+      </div>
+    </div>
   </div>
 
-  <!-- Tab 2: Parsing & Indexing Telemetry (NEW) -->
+  <!-- Tab 2: Parsing & Indexing Telemetry -->
   <div id="tabParsing" style="display: none;">
-    <!-- Parsing Summary Subcards -->
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px;">
       <div class="card" style="border-left: 3px solid var(--purple);">
         <div class="card-top"><span>Indexing Jobs Health</span><span>📦</span></div>
@@ -818,7 +876,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="stagesContainer" style="display: flex; flex-direction: column; gap: 12px;"></div>
     </div>
 
-    <!-- Active Repositories Indexed in Knowledge Graph -->
+    <!-- Active Repositories in Graph -->
     <div class="card" style="margin-bottom: 24px;">
       <h3 style="font-size: 15px; margin-bottom: 4px;">Knowledge Graph Repositories</h3>
       <p style="font-size: 12px; color: var(--muted); margin-bottom: 16px;">Current active repositories parsed into Neo4j graph and Milvus vector collections</p>
@@ -889,6 +947,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
               <th>User ID</th>
               <th>Repositories</th>
               <th>Turns</th>
+              <th>Tools / Citations</th>
               <th>Tokens</th>
               <th>Cost ($)</th>
               <th>Status</th>
@@ -912,6 +971,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
             <tr>
               <th>Message ID</th>
               <th>Model</th>
+              <th>Tools / Citations</th>
               <th>Input Toks</th>
               <th>Output Toks</th>
               <th>Total Toks</th>
@@ -992,6 +1052,12 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('kpiChatSpend').textContent = '$' + d.overview.total_cost.toFixed(4);
       document.getElementById('kpiAvgCost').textContent = 'Avg $' + d.overview.avg_cost_per_conv + ' / conv';
 
+      // Tool calls and citations
+      document.getElementById('kpiTools').textContent = d.overview.total_tool_calls;
+      document.getElementById('kpiCitations').textContent = d.overview.total_citations;
+      document.getElementById('kpiToolsSub').textContent = 
+        d.overview.total_tool_calls + ' tool executions · ' + d.overview.total_citations + ' code citations';
+
       document.getElementById('kpiNodesIndexed').textContent = (p.total_nodes_indexed || 0).toLocaleString();
       document.getElementById('kpiEdgesIndexed').textContent = 
         (p.total_relationships || 0).toLocaleString() + ' relationships · ' + (p.total_parse_errors || 0) + ' errors';
@@ -1045,6 +1111,57 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       `).join('');
 
+      // Tools Breakdown
+      document.getElementById('totalToolsBadge').textContent = d.overview.total_tool_calls + ' calls';
+      const toolsContainer = document.getElementById('toolsContainer');
+      const toolsObj = d.overview.tools_breakdown || {};
+      const toolKeys = Object.keys(toolsObj);
+      if (toolKeys.length === 0) {
+        toolsContainer.innerHTML = `
+          <div style="padding: 14px; border-radius: 8px; background: rgba(255,255,255,0.02); border: 1px solid var(--card-border); font-size: 12px; color: var(--muted);">
+            Available Tools registered: <code class="mono" style="color: var(--cyan);">search_graph_rag</code>, <code class="mono" style="color: var(--cyan);">search_by_name</code>, <code class="mono" style="color: var(--cyan);">read_file</code>, <code class="mono" style="color: var(--cyan);">list_directory</code>, <code class="mono" style="color: var(--cyan);">get_file_summary</code>.<br>
+            <span style="color: var(--faint); font-size: 11px; margin-top: 4px; display: inline-block;">(No active calls recorded yet in prior turns)</span>
+          </div>
+        `;
+      } else {
+        const maxToolCalls = Math.max(...Object.values(toolsObj), 1);
+        toolsContainer.innerHTML = toolKeys.map(k => {
+          const cnt = toolsObj[k];
+          const pct = Math.max(10, Math.min(100, (cnt / maxToolCalls) * 100));
+          return `
+            <div style="display: flex; align-items: center; gap: 10px; font-size: 12px;">
+              <span class="mono" style="width: 140px; color: var(--cyan); font-weight: 500;">⚡ ${k}</span>
+              <div class="bar-wrapper" style="flex: 1;">
+                <div class="bar-fill" style="width: ${pct}%; background: linear-gradient(90deg, #6366f1, #a855f7);"></div>
+              </div>
+              <span class="mono" style="width: 60px; text-align: right; font-weight: 600;">${cnt} calls</span>
+            </div>
+          `;
+        }).join('');
+      }
+
+      // Citations Breakdown
+      document.getElementById('totalCitationsBadge').textContent = d.overview.total_citations + ' cites';
+      const citContainer = document.getElementById('citationsContainer');
+      const topCitations = d.overview.top_citations || [];
+      if (topCitations.length === 0) {
+        citContainer.innerHTML = `
+          <div style="padding: 14px; border-radius: 8px; background: rgba(255,255,255,0.02); border: 1px solid var(--card-border); font-size: 12px; color: var(--muted);">
+            Code citations link AI assertions back to Neo4j nodes and repo files.<br>
+            <span style="color: var(--faint); font-size: 11px; margin-top: 4px; display: inline-block;">(Citations are tracked per turn from hybrid retrieval and tool execution)</span>
+          </div>
+        `;
+      } else {
+        citContainer.innerHTML = topCitations.map(c => `
+          <div style="padding: 10px 12px; border-radius: 8px; background: rgba(255,255,255,0.02); border: 1px solid var(--card-border); display: flex; justify-content: space-between; align-items: center;">
+            <div class="mono" style="font-size: 12px; color: var(--orange); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 80%;">
+              📎 ${c.file}
+            </div>
+            <span class="pill pill-orange" style="font-size: 10px;">${c.count} cites</span>
+          </div>
+        `).join('');
+      }
+
       // Render Tab 2: Parsing Telemetry
       renderParsingTab(p);
 
@@ -1053,17 +1170,26 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
 
       // Render Tab 4: Costliest turns
       const cTbody = document.getElementById('costliestTbody');
-      cTbody.innerHTML = d.costliest_turns.map(t => `
-        <tr>
-          <td class="mono" style="color: var(--muted); font-size: 11px;">${t.msg_id.slice(0, 8)}…</td>
-          <td style="color: var(--cyan); font-weight: 500;">${t.model}</td>
-          <td class="mono" style="color: var(--muted);">${t.input_tokens.toLocaleString()}</td>
-          <td class="mono" style="color: var(--muted);">${t.output_tokens.toLocaleString()}</td>
-          <td class="mono" style="font-weight: 600;">${t.total_tokens.toLocaleString()}</td>
-          <td class="mono">${t.latency_ms ? (t.latency_ms / 1000).toFixed(2) + 's' : '—'}</td>
-          <td class="mono" style="color: var(--orange); font-weight: 700;">$${t.cost.toFixed(5)}</td>
-        </tr>
-      `).join('');
+      cTbody.innerHTML = d.costliest_turns.map(t => {
+        const toolBadges = (t.tool_names && t.tool_names.length)
+          ? t.tool_names.map(name => `<span class="pill pill-purple" style="font-size: 9px; margin-right: 4px;">⚡ ${name}</span>`).join('')
+          : (t.tool_calls_count > 0 ? `<span class="pill pill-purple" style="font-size: 9px;">⚡ ${t.tool_calls_count}</span>` : '<span style="color: var(--faint); font-size: 11px;">None</span>');
+        const citBadge = t.citations_count > 0
+          ? `<span class="pill pill-orange" style="font-size: 9px; margin-left: 4px;">📎 ${t.citations_count}</span>`
+          : '';
+        return `
+          <tr>
+            <td class="mono" style="color: var(--muted); font-size: 11px;">${t.msg_id.slice(0, 8)}…</td>
+            <td style="color: var(--cyan); font-weight: 500;">${t.model}</td>
+            <td>${toolBadges}${citBadge}</td>
+            <td class="mono" style="color: var(--muted);">${t.input_tokens.toLocaleString()}</td>
+            <td class="mono" style="color: var(--muted);">${t.output_tokens.toLocaleString()}</td>
+            <td class="mono" style="font-weight: 600;">${t.total_tokens.toLocaleString()}</td>
+            <td class="mono">${t.latency_ms ? (t.latency_ms / 1000).toFixed(2) + 's' : '—'}</td>
+            <td class="mono" style="color: var(--orange); font-weight: 700;">$${t.cost.toFixed(5)}</td>
+          </tr>
+        `;
+      }).join('');
 
       // Render Tab 5: Repos & Users
       const rContainer = document.getElementById('reposContainer');
@@ -1092,7 +1218,6 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
     function renderParsingTab(p) {
       if (!p) return;
 
-      // Parsing subcards
       document.getElementById('parseJobsHealth').textContent = p.completed_jobs + ' / ' + p.total_jobs;
       document.getElementById('parseJobsHealthSub').textContent = 
         p.completed_jobs + ' completed · ' + p.failed_jobs + ' failed · ' + p.running_jobs + ' running';
@@ -1113,7 +1238,6 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('parseModelRatio').textContent = 
         '$' + (pCosts.total_cost || 0).toFixed(4) + ' / $' + (pCosts.gpt4o_comparison_spend || 0).toFixed(4);
 
-      // Pipeline stages breakdown
       const stagesContainer = document.getElementById('stagesContainer');
       const stages = p.stages || [];
       if (stages.length === 0) {
@@ -1151,7 +1275,6 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
         }).join('');
       }
 
-      // Repositories in graph table
       const reposTbody = document.getElementById('reposIndexedTbody');
       const repos = p.repos || [];
       if (repos.length === 0) {
@@ -1234,7 +1357,7 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
       const tbody = document.getElementById('conversationsTbody');
       tbody.innerHTML = convs.map(c => `
         <tr style="opacity: ${c.is_deleted ? '0.6' : '1'};">
-          <td style="max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500;">
+          <td style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500;">
             ${c.title || 'Untitled Session'}
           </td>
           <td style="color: var(--muted); font-size: 12px;">${c.user_id}</td>
@@ -1242,6 +1365,10 @@ STANDALONE_DASHBOARD_HTML = """<!DOCTYPE html>
             ${(c.repository_ids || []).map(r => `<span class="pill pill-blue" style="font-size: 9px; margin-right: 4px;">${r}</span>`).join('') || '<span style="color: var(--faint);">None</span>'}
           </td>
           <td class="mono">${c.turn_count}</td>
+          <td>
+            <span class="pill pill-purple" style="font-size: 10px; margin-right: 4px;">⚡ ${c.total_tool_calls || 0}</span>
+            <span class="pill pill-orange" style="font-size: 10px;">📎 ${c.total_citations || 0}</span>
+          </td>
           <td class="mono">${c.total_tokens.toLocaleString()}</td>
           <td class="mono" style="color: var(--orange); font-weight: 600;">$${c.total_cost.toFixed(4)}</td>
           <td>
