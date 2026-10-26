@@ -12,6 +12,7 @@ from src.config import settings
 from src.db.cosmos_client import CosmosClientManager
 from src.services.conversation_service import ConversationService
 from src.api.routes import conversations, messages, health, explorer, analytics
+from src.api.auth import admin_auth_router
 
 logger = logging.getLogger("conversation-service")
 
@@ -50,6 +51,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(admin_auth_router)
 app.include_router(explorer.router)
 app.include_router(health.router)
 app.include_router(conversations.router)

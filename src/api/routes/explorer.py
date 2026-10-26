@@ -8,13 +8,15 @@ Accessible at http://localhost:8002/explorer
 from __future__ import annotations
 
 import json
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
+
+from src.api.auth import is_admin_authenticated, require_admin_api, render_admin_gatekeeper
 
 router = APIRouter(tags=["explorer"])
 
 
-@router.get("/api/explorer/data", summary="Raw Cosmos DB data for Data Explorer")
+@router.get("/api/explorer/data", summary="Raw Cosmos DB data for Data Explorer", dependencies=[Depends(require_admin_api)])
 async def get_explorer_data():
     from src.app import db_manager
     return db_manager.get_all_data()
@@ -22,7 +24,9 @@ async def get_explorer_data():
 
 @router.get("/explorer", response_class=HTMLResponse, summary="Visual Cosmos DB Data Explorer")
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def cosmos_data_explorer():
+async def cosmos_data_explorer(request: Request):
+    if not is_admin_authenticated(request):
+        return HTMLResponse(content=render_admin_gatekeeper("Cosmos DB Data Explorer", "/explorer"))
     html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>

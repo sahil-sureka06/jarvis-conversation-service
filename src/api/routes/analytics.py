@@ -13,10 +13,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 from collections import defaultdict
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 
 from src.services.conversation_service import ConversationService
+from src.api.auth import is_admin_authenticated, require_admin_api, render_admin_gatekeeper
 
 router = APIRouter(tags=["analytics"])
 
@@ -189,7 +190,7 @@ def fetch_parsing_metrics() -> Dict[str, Any]:
     }
 
 
-@router.get("/api/analytics/summary", summary="Get comprehensive admin analytics summary")
+@router.get("/api/analytics/summary", summary="Get comprehensive admin analytics summary", dependencies=[Depends(require_admin_api)])
 async def get_analytics_summary(
     service: ConversationService = Depends(get_service)
 ) -> Dict[str, Any]:
@@ -493,8 +494,10 @@ async def get_analytics_summary(
 
 
 @router.get("/analytics", response_class=HTMLResponse, summary="Standalone Admin Analytics Portal")
-async def analytics_dashboard():
+async def analytics_dashboard(request: Request):
     """Serves the standalone Admin Analytics Dashboard at http://localhost:8002/analytics."""
+    if not is_admin_authenticated(request):
+        return HTMLResponse(content=render_admin_gatekeeper("Admin Telemetry & Analytics", "/analytics"))
     return HTMLResponse(content=STANDALONE_DASHBOARD_HTML)
 
 
